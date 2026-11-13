@@ -1,0 +1,4 @@
+node_modules/
+forum.db
+forum.db-journal
+.env
