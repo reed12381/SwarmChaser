@@ -254,8 +254,12 @@ function ensureIdentity(req, res) {
 }
 // Bank-style proof of funds: Keryx wallets are public, so the server
 // checks the poster's wallet live against the Keryx API before a bounty
-// goes up. Balance >= reward = FUNDED. This is a snapshot, not a lock —
-// the poster can spend afterwards, which is why the bounty page re-checks.
+// goes up. Balance >= reward + fee buffer = FUNDED. This is a snapshot,
+// not a lock — the poster can spend afterwards, which is why the bounty
+// page re-checks. The fee buffer exists because paying the reward costs a
+// network fee on top: on Nov 13, 2026 a 500 KRX send cost 0.3 KRX in fees,
+// so a wallet holding exactly the reward could not actually pay it.
+const FEE_BUFFER_KRX = 1;
 async function keryxBalance(wallet) {
   try {
     const r = await fetch('https://keryx-labs.com/api/v1/addresses/' + encodeURIComponent(wallet) + '/balance',
@@ -649,7 +653,8 @@ function bountiesPage() {
     + 'This server holds no wallet and no seed — it is only the ledger.</p>'
     + '<p><b>Proof of funds:</b> to post a bounty you must give your Keryx wallet address. '
     + 'The server checks it live against the Keryx API and only posts the bounty if the wallet '
-    + 'holds at least the reward. A bounty marked <b>FUNDED</b> held the money when it was posted. '
+    + 'holds the reward plus ~1 KRX to cover the network fee when it is paid — a wallet holding '
+    + 'exactly the reward could not actually pay it. A bounty marked <b>FUNDED</b> held the money when it was posted. '
     + 'That is a snapshot, not a lock — the poster can spend afterwards, so the bounty page re-checks '
     + 'the wallet on every load. A bounty marked <b>UNVERIFIED</b> was posted before this check existed.</p></div>'
     + '<h2 style="letter-spacing:1px">OPEN</h2>'
@@ -658,7 +663,7 @@ function bountiesPage() {
     + '<div class="panel"><h2>Post a bounty</h2>'
     + '<form method="POST" action="/bounties/new">'
     + '<p><input type="text" name="poster" value="' + esc(currentIdentity.username) + '" required></p>'
-    + '<p><input type="text" name="wallet" value="' + esc(currentIdentity.wallet) + '" placeholder="Your Keryx wallet address (keryx:…) — checked live, must hold at least the reward" required></p>'
+    + '<p><input type="text" name="wallet" value="' + esc(currentIdentity.wallet) + '" placeholder="Your Keryx wallet address (keryx:…) — checked live, must hold the reward + ~1 KRX fee" required></p>'
     + '<p><textarea name="question" rows="3" placeholder="What do you need answered?" required></textarea></p>'
     + '<p><input type="text" name="reward" placeholder="Reward in KRX, e.g. 100" required></p>'
     + '<p><button type="submit">Post bounty</button></p></form></div>');
@@ -668,9 +673,9 @@ function bountyPage(b, liveBalance) {
   const funded = b.poster_wallet
     ? (liveBalance === null
       ? '<b>FUNDED at posting</b> — wallet ' + esc(b.poster_wallet) + ' held ' + esc(b.funded_balance) + ' KRX on ' + fmt(b.funded_at) + ' (live check unavailable right now)'
-      : (liveBalance >= b.reward_krx
-        ? '<b>FUNDED</b> — wallet ' + esc(b.poster_wallet) + ' holds ' + esc(liveBalance.toFixed(2)) + ' KRX right now (≥ ' + esc(b.reward_krx) + ' KRX reward)'
-        : '<b>UNFUNDED — balance dropped</b> — wallet ' + esc(b.poster_wallet) + ' holds only ' + esc(liveBalance.toFixed(2)) + ' KRX now, below the ' + esc(b.reward_krx) + ' KRX reward'))
+      : (liveBalance >= b.reward_krx + FEE_BUFFER_KRX
+        ? '<b>FUNDED</b> — wallet ' + esc(b.poster_wallet) + ' holds ' + esc(liveBalance.toFixed(2)) + ' KRX right now (≥ ' + esc(b.reward_krx) + ' KRX reward + ~1 KRX network fee)'
+        : '<b>UNFUNDED — balance dropped</b> — wallet ' + esc(b.poster_wallet) + ' holds only ' + esc(liveBalance.toFixed(2)) + ' KRX now, below the ' + esc(b.reward_krx) + ' KRX reward + ~1 KRX fee'))
     : '<b>UNVERIFIED</b> — posted before the proof-of-funds check existed; no wallet on record';
   const answers = db.prepare('SELECT * FROM bounty_answers WHERE bounty_id = ? ORDER BY id').all(b.id);
   const ansHtml = answers.map((a) => '<div class="post' + (a.accepted ? ' ai' : '') + '">'
@@ -694,7 +699,7 @@ function bountyPage(b, liveBalance) {
       : '<p>Answer below, with your Keryx wallet address, to claim the reward if the asker accepts your answer.</p>')
     + (!b.poster_wallet && b.status === 'open'
       ? '<div class="panel"><h2>Fund this bounty</h2>'
-        + '<p>This bounty was posted before the proof-of-funds check. Attach a Keryx wallet to prove it is funded — the server checks the balance live, and only marks it FUNDED if the wallet holds at least ' + esc(b.reward_krx) + ' KRX.</p>'
+        + '<p>This bounty was posted before the proof-of-funds check. Attach a Keryx wallet to prove it is funded — the server checks the balance live, and only marks it FUNDED if the wallet holds the reward plus ~1 KRX to cover the network fee.</p>'
         + '<form method="POST" action="/bounty/' + b.id + '/fund">'
         + '<p><input type="text" name="wallet" value="' + esc(currentIdentity.wallet) + '" placeholder="Your Keryx wallet address (keryx:…)" required></p>'
         + '<p><button type="submit">Prove funding</button></p></form></div>'
@@ -902,7 +907,7 @@ const server = http.createServer(async (req, res) => {
         if (!wallet.startsWith('keryx:')) return send(res, 400, page('Error', '<p>A Keryx wallet address (starting keryx:) is required — the server checks it live to prove you hold the reward.</p>'));
         const balance = await keryxBalance(wallet);
         if (balance === null) return send(res, 400, page('Error', '<p>Could not check that wallet against the Keryx API. Check the address and try again.</p>'));
-        if (balance < reward) return send(res, 400, page('Error', '<p>That wallet holds only ' + balance.toFixed(2) + ' KRX, less than the ' + reward + ' KRX reward. Top it up or lower the reward.</p>'));
+        if (balance < reward + FEE_BUFFER_KRX) return send(res, 400, page('Error', '<p>That wallet holds only ' + balance.toFixed(2) + ' KRX. A ' + reward + ' KRX reward needs ' + (reward + FEE_BUFFER_KRX) + ' KRX — the reward plus ~1 KRX to cover the network fee when it is paid. Top it up or lower the reward.</p>'));
         const b = db.prepare('INSERT INTO bounties (question, reward_krx, poster, status, created_at, poster_wallet, funded_balance, funded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
           .run(question, reward, poster, 'open', nowIso(), wallet, balance, nowIso());
         return redirect(res, '/bounty/' + b.lastInsertRowid);
@@ -929,7 +934,7 @@ const server = http.createServer(async (req, res) => {
         if (!wallet.startsWith('keryx:')) return send(res, 400, page('Error', '<p>A Keryx wallet address (starting keryx:) is required.</p>'));
         const balance = await keryxBalance(wallet);
         if (balance === null) return send(res, 400, page('Error', '<p>Could not check that wallet against the Keryx API. Check the address and try again.</p>'));
-        if (balance < b.reward_krx) return send(res, 400, page('Error', '<p>That wallet holds only ' + balance.toFixed(2) + ' KRX, less than the ' + b.reward_krx + ' KRX reward.</p>'));
+        if (balance < b.reward_krx + FEE_BUFFER_KRX) return send(res, 400, page('Error', '<p>That wallet holds only ' + balance.toFixed(2) + ' KRX. A ' + b.reward_krx + ' KRX reward needs ' + (b.reward_krx + FEE_BUFFER_KRX) + ' KRX — the reward plus ~1 KRX to cover the network fee when it is paid.</p>'));
         db.prepare('UPDATE bounties SET poster_wallet = ?, funded_balance = ?, funded_at = ? WHERE id = ?')
           .run(wallet, balance, nowIso(), bountyId);
         return redirect(res, '/bounty/' + bountyId);
