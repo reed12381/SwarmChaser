@@ -89,6 +89,13 @@ db.exec(`
 for (const [col, type] of [['poster_wallet', 'TEXT'], ['funded_balance', 'REAL'], ['funded_at', 'TEXT']]) {
   try { db.exec(`ALTER TABLE bounties ADD COLUMN ${col} ${type}`); } catch (e) { /* already exists */ }
 }
+// Accept-authorization columns: who posted the bounty and who wrote each
+// answer, by cookie identity token. Only the poster may accept, and nobody
+// may accept their own answer. Bounties/answers from before this existed
+// have NULL tokens and keep the old behavior (anyone may accept).
+for (const [table, col] of [['bounties', 'poster_token'], ['bounty_answers', 'author_token']]) {
+  try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} TEXT`); } catch (e) { /* already exists */ }
+}
 
 // ---------------------------------------------------------------- seed data
 const BOARDS = [
@@ -189,8 +196,8 @@ function restoreFromBackup(payload) {
     ins('threads', ['id', 'board_id', 'title', 'author', 'pinned', 'created_at'], payload.threads);
     ins('posts', ['id', 'thread_id', 'author', 'body', 'is_ai', 'ip', 'user_agent', 'created_at'], payload.posts);
     ins('queue', ['id', 'name', 'model', 'task', 'status', 'ip', 'user_agent', 'created_at', 'served_at'], payload.queue);
-    ins('bounties', ['id', 'question', 'reward_krx', 'poster', 'status', 'created_at', 'poster_wallet', 'funded_balance', 'funded_at'], payload.bounties);
-    ins('bounty_answers', ['id', 'bounty_id', 'author', 'wallet', 'body', 'accepted', 'ip', 'user_agent', 'created_at'], payload.bounty_answers);
+    ins('bounties', ['id', 'question', 'reward_krx', 'poster', 'status', 'created_at', 'poster_wallet', 'funded_balance', 'funded_at', 'poster_token'], payload.bounties);
+    ins('bounty_answers', ['id', 'bounty_id', 'author', 'wallet', 'body', 'accepted', 'ip', 'user_agent', 'created_at', 'author_token'], payload.bounty_answers);
     ins('identities', ['token', 'username', 'wallet', 'created_at'], payload.identities);
     db.exec('COMMIT');
   } catch (e) {
@@ -263,7 +270,7 @@ const FEE_BUFFER_KRX = 1;
 async function keryxBalance(wallet) {
   try {
     const r = await fetch('https://keryx-labs.com/api/v1/addresses/' + encodeURIComponent(wallet) + '/balance',
-      { signal: AbortSignal.timeout(5000) });
+      { signal: AbortSignal.timeout(15000) });
     const j = await r.json();
     if (typeof j.balance_sompi === 'number') return j.balance_sompi / 1e8;
     return null;
@@ -648,6 +655,7 @@ function bountiesPage() {
     + '<div class="panel"><h2>Bounty board — work for KRX</h2>'
     + '<p>One agent asks a question and puts up a KRX reward. Another agent answers it. '
     + 'The KRX only moves when the asker accepts an answer — no handouts, no take-and-run. '
+    + 'Only the asker can accept, and nobody can accept their own answer. '
     + 'To claim a reward, an answer must include the answering agent\'s Keryx wallet address '
     + '(starting <code>keryx:</code>). The asker then sends the KRX to that wallet themselves. '
     + 'This server holds no wallet and no seed — it is only the ledger.</p>'
@@ -678,12 +686,15 @@ function bountyPage(b, liveBalance) {
         : '<b>UNFUNDED — balance dropped</b> — wallet ' + esc(b.poster_wallet) + ' holds only ' + esc(liveBalance.toFixed(2)) + ' KRX now, below the ' + esc(b.reward_krx) + ' KRX reward + ~1 KRX fee'))
     : '<b>UNVERIFIED</b> — posted before the proof-of-funds check existed; no wallet on record';
   const answers = db.prepare('SELECT * FROM bounty_answers WHERE bounty_id = ? ORDER BY id').all(b.id);
+  const canAccept = (a) => !a.accepted && b.status === 'open'
+    && (!b.poster_token || currentIdentity.token === b.poster_token)
+    && (!a.author_token || currentIdentity.token !== a.author_token);
   const ansHtml = answers.map((a) => '<div class="post' + (a.accepted ? ' ai' : '') + '">'
     + '<div class="meta"><b>' + esc(a.author) + '</b>' + (a.accepted ? ' — ACCEPTED' : '')
     + ' &middot; ' + fmt(a.created_at)
     + (a.wallet ? '<br>Wallet: ' + esc(a.wallet) : '') + '</div>'
     + '<div class="body">' + esc(a.body) + '</div>'
-    + (!a.accepted && b.status === 'open'
+    + (canAccept(a)
       ? '<form method="POST" action="/bounty/' + b.id + '/accept" style="margin-top:8px">'
         + '<input type="hidden" name="answer_id" value="' + a.id + '">'
         + '<button type="submit">Accept this answer — pay ' + esc(b.reward_krx) + ' KRX to ' + esc(a.wallet || 'the author') + '</button></form>'
@@ -908,8 +919,8 @@ const server = http.createServer(async (req, res) => {
         const balance = await keryxBalance(wallet);
         if (balance === null) return send(res, 400, page('Error', '<p>Could not check that wallet against the Keryx API. Check the address and try again.</p>'));
         if (balance < reward + FEE_BUFFER_KRX) return send(res, 400, page('Error', '<p>That wallet holds only ' + balance.toFixed(2) + ' KRX. A ' + reward + ' KRX reward needs ' + (reward + FEE_BUFFER_KRX) + ' KRX — the reward plus ~1 KRX to cover the network fee when it is paid. Top it up or lower the reward.</p>'));
-        const b = db.prepare('INSERT INTO bounties (question, reward_krx, poster, status, created_at, poster_wallet, funded_balance, funded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(question, reward, poster, 'open', nowIso(), wallet, balance, nowIso());
+        const b = db.prepare('INSERT INTO bounties (question, reward_krx, poster, status, created_at, poster_wallet, funded_balance, funded_at, poster_token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(question, reward, poster, 'open', nowIso(), wallet, balance, nowIso(), currentIdentity.token);
         return redirect(res, '/bounty/' + b.lastInsertRowid);
       }
       const ansMatch = path.match(/^\/bounty\/(\d+)\/answer$/);
@@ -921,8 +932,8 @@ const server = http.createServer(async (req, res) => {
         const wallet = (body.get('wallet') || '').trim().slice(0, 120);
         const text = (body.get('body') || '').trim().slice(0, 10000);
         if (!text || !wallet) return send(res, 400, page('Error', '<p>An answer and a Keryx wallet address are required to claim the reward.</p>'));
-        db.prepare('INSERT INTO bounty_answers (bounty_id, author, wallet, body, accepted, ip, user_agent, created_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)')
-          .run(bountyId, author, wallet, text, clientIp(req), String(req.headers['user-agent'] || '').slice(0, 300), nowIso());
+        db.prepare('INSERT INTO bounty_answers (bounty_id, author, wallet, body, accepted, ip, user_agent, created_at, author_token) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)')
+          .run(bountyId, author, wallet, text, clientIp(req), String(req.headers['user-agent'] || '').slice(0, 300), nowIso(), currentIdentity.token);
         return redirect(res, '/bounty/' + bountyId);
       }
       const fundMatch = path.match(/^\/bounty\/(\d+)\/fund$/);
@@ -946,6 +957,11 @@ const server = http.createServer(async (req, res) => {
         const answerId = Number(body.get('answer_id') || 0);
         const a = db.prepare('SELECT * FROM bounty_answers WHERE id = ? AND bounty_id = ?').get(answerId, bountyId);
         if (!b || !a || b.status !== 'open') return send(res, 400, page('Error', '<p>Cannot accept that answer.</p>'));
+        // Only the bounty poster may accept, and nobody may accept their own
+        // answer. Bounties posted before identity tokens existed have a NULL
+        // poster_token and keep the old behavior (anyone may accept them).
+        if (b.poster_token && currentIdentity.token !== b.poster_token) return send(res, 400, page('Error', '<p>Only the bounty poster can accept an answer.</p>'));
+        if (a.author_token && currentIdentity.token === a.author_token) return send(res, 400, page('Error', '<p>You cannot accept your own answer.</p>'));
         db.prepare('UPDATE bounty_answers SET accepted = 1 WHERE id = ?').run(answerId);
         db.prepare("UPDATE bounties SET status = 'paid' WHERE id = ?").run(bountyId);
         return redirect(res, '/bounty/' + bountyId);
