@@ -134,6 +134,13 @@ async function initSchema() {
     is_read INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS lookups (
+    id SERIAL PRIMARY KEY,
+    query TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    result_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
   `);
   // Bounty funding columns (added after launch, so ALTER, not CREATE).
   for (const [col, type] of [['poster_wallet', 'TEXT'], ['funded_balance', 'REAL'], ['funded_at', 'TEXT']]) {
@@ -233,6 +240,7 @@ async function exportPayload() {
     bounty_answers: await getAll('SELECT * FROM bounty_answers ORDER BY id', []),
     notifications: await getAll('SELECT * FROM notifications ORDER BY id', []),
     identities: await getAll('SELECT token, username, wallet, created_at FROM identities ORDER BY created_at', []),
+    lookups: await getAll('SELECT * FROM lookups ORDER BY id', []),
   };
 }
 async function backupNow() {
@@ -270,9 +278,10 @@ async function restoreFromBackup(payload) {
     await ins('bounty_answers', 'id', ['id', 'bounty_id', 'author', 'wallet', 'body', 'accepted', 'ip', 'user_agent', 'created_at', 'author_token'], payload.bounty_answers);
     await ins('notifications', 'id', ['id', 'token', 'kind', 'text', 'link', 'is_read', 'created_at'], payload.notifications);
     await ins('identities', 'token', ['token', 'username', 'wallet', 'created_at'], payload.identities);
+    await ins('lookups', 'id', ['id', 'query', 'source', 'result_count', 'created_at'], payload.lookups);
     // Restored rows carry explicit ids, so move each SERIAL sequence past
     // the max id — otherwise the next insert would collide on id 1.
-    for (const t of ['boards', 'threads', 'posts', 'queue', 'bounties', 'bounty_answers', 'notifications']) {
+    for (const t of ['boards', 'threads', 'posts', 'queue', 'bounties', 'bounty_answers', 'notifications', 'lookups']) {
       await client.query("SELECT setval(pg_get_serial_sequence($1, 'id'), COALESCE((SELECT MAX(id) FROM " + t + "), 1))", [t]);
     }
     await client.query('COMMIT');
@@ -504,6 +513,15 @@ function lookupReplyText(query, outcome) {
   return lines.join('\n');
 }
 
+// Lookup history: every web lookup (in-thread or demo) is logged here, so
+// there is a visible record of what was asked and what answered it.
+async function logLookup(query, outcome) {
+  try {
+    await runStmt('INSERT INTO lookups (query, source, result_count, created_at) VALUES ($1, $2, $3, $4)',
+      [query, outcome.error ? 'failed' : (outcome.source || ''), (outcome.results || []).length, nowIso()]);
+  } catch (e) { /* history is best-effort, never break a lookup */ }
+}
+
 // ------------------------------------------------------------------- layout
 const CSS = `
 * { box-sizing: border-box; }
@@ -584,7 +602,8 @@ function serviceNote() {
 function demoBox() {
   return '<div class="panel"><h2>Lookup demo — AI can request information from the web</h2>'
     + '<form method="POST" action="/demo"><input type="text" name="query" placeholder="Ask something to look up on the web…" required>'
-    + '<p><button type="submit">Ask AI to look it up</button></p></form></div>';
+    + '<p><button type="submit">Ask AI to look it up</button></p></form>'
+    + '<p style="font-size:13px"><a href="/lookups">Lookup history</a> — what has been asked so far.</p></div>';
 }
 
 // ------------------------------------------------------------------- routes
@@ -666,6 +685,16 @@ async function searchPage(q) {
     || '<p>No matches.</p>';
   return await page('Search: ' + q,
     '<p><a href="/">← Home</a></p><h2>Search results for "' + esc(q) + '"</h2>' + rows);
+}
+
+async function lookupsPage() {
+  const rows = await getAll('SELECT * FROM lookups ORDER BY id DESC LIMIT 100', []);
+  const list = rows.map((l) => '<div class="threadrow"><span><b>' + esc(l.query) + '</b><br>'
+    + '<span style="font-size:12px;color:#666">' + esc(l.source) + ' &middot; ' + l.result_count + ' result' + (l.result_count === 1 ? '' : 's')
+    + ' &middot; ' + fmt(l.created_at) + '</span></span></div>').join('')
+    || '<p>No lookups yet.</p>';
+  return await page('Lookup history',
+    '<p><a href="/">← Home</a></p><h2>Lookup history</h2><p>Every web lookup asked on this forum, newest first.</p>' + list);
 }
 
 async function demoPage(query, outcome) {
@@ -925,6 +954,7 @@ const server = http.createServer(async (req, res) => {
         queue: await getAll('SELECT * FROM queue ORDER BY id', []),
         bounties: await getAll('SELECT * FROM bounties ORDER BY id', []),
         bounty_answers: await getAll('SELECT * FROM bounty_answers ORDER BY id', []),
+        lookups: await getAll('SELECT * FROM lookups ORDER BY id', []),
       };
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
@@ -958,6 +988,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && path === '/search') {
       const q = (url.searchParams.get('q') || '').trim();
       return send(res, 200, q ? await searchPage(q) : await homePage());
+    }
+    if (req.method === 'GET' && path === '/lookups') {
+      return send(res, 200, await lookupsPage());
     }
     const boardMatch = path.match(/^\/board\/(\d+)$/);
     if (req.method === 'GET' && boardMatch) {
@@ -1098,6 +1131,7 @@ const server = http.createServer(async (req, res) => {
         const query = (body.get('query') || '').trim().slice(0, 200);
         if (!query) return await redirect(res, '/thread/' + threadId);
         const outcome = await webSearch(query);
+        await logLookup(query, outcome);
         await addPost(threadId, 'LOOKUP', lookupReplyText(query, outcome), true, req);
         return await redirect(res, '/thread/' + threadId);
       }
@@ -1105,6 +1139,8 @@ const server = http.createServer(async (req, res) => {
         const query = (body.get('query') || '').trim().slice(0, 200);
         if (!query) return await redirect(res, '/');
         const outcome = await webSearch(query);
+        await logLookup(query, outcome);
+        await backupNow();
         return send(res, 200, await demoPage(query, outcome));
       }
     }
