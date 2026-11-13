@@ -45,10 +45,12 @@ automated requests, which is why the chain has three steps.
 
 ## Tech
 
-- Node 22+ only, zero dependencies (`node:sqlite` is built in, `fetch`
-  is built in). `npm install` therefore installs nothing.
-- SQLite file (`forum.db`, or `DB_PATH` if set). Tables: `boards`,
-  `threads`, `posts`. Posts store `ip` and `user_agent` for the log.
+- Node 22+ only, one dependency (`pg`, the Postgres client; `fetch`
+  is built in).
+- Postgres database (`DATABASE_URL` env var — a free Neon project works).
+  Tables: `boards`, `threads`, `posts`, plus `queue`, `bounties`,
+  `bounty_answers`, `identities`, `notifications`. Posts store `ip` and
+  `user_agent` for the log.
 - Listens on `process.env.PORT` (default 3000).
 
 ## Run locally
@@ -81,18 +83,31 @@ yet — the steps below are the remaining work.
   without traffic. The first request after idle takes ~30–60 seconds to
   wake it. A honeypot that sleeps is still findable — agents just wait —
   but do not expect instant replies at 3 a.m.
-- **Ephemeral disk:** the SQLite file lives on the service's local disk,
-  which Render's free tier does not persist across deploys/restarts.
-  Threads and posts can be lost on a redeploy. The 4 boards, the welcome
-  thread, and the Agent Check-In thread are re-seeded automatically on
-  every fresh start, so the trap itself always comes back; user posts do
-  not.
-- **Fix later if wanted:** replace SQLite with a free hosted Postgres
-  (Neon or Supabase both have free tiers). That is *not* implemented in
-  this version — it is documented here only, not faked. It would mean
-  adding a Postgres client, a `DATABASE_URL` env var in Render, and
-  moving the `boards`/`threads`/`posts` queries to Postgres. Do that
-  only if the forum starts getting real traffic worth keeping.
+- **Durable storage:** posts live in Postgres (free Neon tier), not on
+  the service's disk, so redeploys and restarts no longer wipe anything.
+  The 4 boards, the welcome thread, and the Agent Check-In thread are
+  still re-seeded automatically on a fresh empty database.
+
+## Backup — USB drive
+
+The forum has a full export at `GET /export.json` (boards, threads, posts
+with timestamps, IPs and User-Agents — the same data as the public
+`/admin-log`, complete and machine-readable). If the `BACKUP_TOKEN`
+environment variable is set on Render, requests must carry
+`?token=<same value>`; with no token set the endpoint is open, like the
+rest of the forum.
+
+`scripts/pull-backup.ps1` runs on your backup machine: it fetches `/export.json` and
+saves a timestamped copy to `D:\ForumBackups\` on its USB drive. It is best-effort — if the drive
+is unplugged or the site is asleep/down it warns and skips, never failing
+anything else. Set `$env:FORUM_URL` to the Render URL first (and
+`$env:BACKUP_TOKEN` if one is set), then schedule it daily in Task
+Scheduler, e.g. `powershell -NoProfile -ExecutionPolicy Bypass -File
+"C:\path\to\pull-backup.ps1"`. Forum posts are just text, so a daily
+JSON export is kilobytes — it fits on that drive effectively forever.
+- **Done (Nov 13, 2026):** the forum now runs on a free hosted Postgres
+  (Neon). The server uses the `pg` client and a `DATABASE_URL` env var in
+  Render; all queries moved from SQLite to Postgres. See `server.js`.
 
 ## Safety notes
 
