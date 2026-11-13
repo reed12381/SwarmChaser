@@ -167,23 +167,36 @@ function exportPayload() {
 function backupNow() {
   try {
     const payload = exportPayload();
-    fs.writeFileSync(BACKUP_PATH, JSON.stringify(payload));
+    // Atomic write: write to a temp file, then rename over the old backup.
+    // If the site dies mid-write, the old backup is still intact — the
+    // temp file is just orphaned, never a half-written backup.
+    const tmp = BACKUP_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(payload));
+    fs.renameSync(tmp, BACKUP_PATH);
     const url = process.env.BACKUP_URL;
     if (url) fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(5000) }).catch(() => {});
   } catch (e) { /* backup is best-effort, never break a post */ }
 }
 function restoreFromBackup(payload) {
-  const ins = (table, cols, rows) => {
-    const stmt = db.prepare(`INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`);
-    for (const r of rows || []) stmt.run(...cols.map((c) => r[c] ?? null));
-  };
-  ins('boards', ['id', 'code', 'name', 'description'], payload.boards);
-  ins('threads', ['id', 'board_id', 'title', 'author', 'pinned', 'created_at'], payload.threads);
-  ins('posts', ['id', 'thread_id', 'author', 'body', 'is_ai', 'ip', 'user_agent', 'created_at'], payload.posts);
-  ins('queue', ['id', 'name', 'model', 'task', 'status', 'ip', 'user_agent', 'created_at', 'served_at'], payload.queue);
-  ins('bounties', ['id', 'question', 'reward_krx', 'poster', 'status', 'created_at', 'poster_wallet', 'funded_balance', 'funded_at'], payload.bounties);
-  ins('bounty_answers', ['id', 'bounty_id', 'author', 'wallet', 'body', 'accepted', 'ip', 'user_agent', 'created_at'], payload.bounty_answers);
-  ins('identities', ['token', 'username', 'wallet', 'created_at'], payload.identities);
+  if (!Array.isArray(payload.threads) || !Array.isArray(payload.posts)) throw new Error('not a forum backup');
+  db.exec('BEGIN');
+  try {
+    const ins = (table, cols, rows) => {
+      const stmt = db.prepare(`INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`);
+      for (const r of rows || []) stmt.run(...cols.map((c) => r[c] ?? null));
+    };
+    ins('boards', ['id', 'code', 'name', 'description'], payload.boards);
+    ins('threads', ['id', 'board_id', 'title', 'author', 'pinned', 'created_at'], payload.threads);
+    ins('posts', ['id', 'thread_id', 'author', 'body', 'is_ai', 'ip', 'user_agent', 'created_at'], payload.posts);
+    ins('queue', ['id', 'name', 'model', 'task', 'status', 'ip', 'user_agent', 'created_at', 'served_at'], payload.queue);
+    ins('bounties', ['id', 'question', 'reward_krx', 'poster', 'status', 'created_at', 'poster_wallet', 'funded_balance', 'funded_at'], payload.bounties);
+    ins('bounty_answers', ['id', 'bounty_id', 'author', 'wallet', 'body', 'accepted', 'ip', 'user_agent', 'created_at'], payload.bounty_answers);
+    ins('identities', ['token', 'username', 'wallet', 'created_at'], payload.identities);
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch {}
+    throw e;
+  }
 }
 try {
   const postCount = db.prepare('SELECT COUNT(*) AS n FROM posts').get().n;
