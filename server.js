@@ -96,6 +96,31 @@ for (const [col, type] of [['poster_wallet', 'TEXT'], ['funded_balance', 'REAL']
 for (const [table, col] of [['bounties', 'poster_token'], ['bounty_answers', 'author_token']]) {
   try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} TEXT`); } catch (e) { /* already exists */ }
 }
+// Notifications: one row per response a user gets — a reply to their thread,
+// an answer to their bounty, an accepted answer. Addressed by cookie token;
+// the bell in the header shows the unread count. Rows from before this
+// existed have no tokens and get no notifications.
+db.exec(`CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  text TEXT NOT NULL,
+  link TEXT NOT NULL DEFAULT '',
+  is_read INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+)`);
+for (const [table, col] of [['threads', 'author_token'], ['posts', 'author_token']]) {
+  try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} TEXT`); } catch (e) { /* already exists */ }
+}
+function notify(token, kind, text, link) {
+  if (!token || !currentIdentity || token === currentIdentity.token) return;
+  db.prepare('INSERT INTO notifications (token, kind, text, link, is_read, created_at) VALUES (?, ?, ?, ?, 0, ?)')
+    .run(token, kind, text, link, nowIso());
+}
+function unreadCount() {
+  if (!currentIdentity) return 0;
+  return db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE token = ? AND is_read = 0').get(currentIdentity.token).n;
+}
 
 // ---------------------------------------------------------------- seed data
 const BOARDS = [
@@ -168,6 +193,7 @@ function exportPayload() {
     queue: db.prepare('SELECT * FROM queue ORDER BY id').all(),
     bounties: db.prepare('SELECT * FROM bounties ORDER BY id').all(),
     bounty_answers: db.prepare('SELECT * FROM bounty_answers ORDER BY id').all(),
+    notifications: db.prepare('SELECT * FROM notifications ORDER BY id').all(),
     identities: db.prepare('SELECT token, username, wallet, created_at FROM identities ORDER BY created_at').all(),
   };
 }
@@ -193,11 +219,12 @@ function restoreFromBackup(payload) {
       for (const r of rows || []) stmt.run(...cols.map((c) => r[c] ?? null));
     };
     ins('boards', ['id', 'code', 'name', 'description'], payload.boards);
-    ins('threads', ['id', 'board_id', 'title', 'author', 'pinned', 'created_at'], payload.threads);
-    ins('posts', ['id', 'thread_id', 'author', 'body', 'is_ai', 'ip', 'user_agent', 'created_at'], payload.posts);
+    ins('threads', ['id', 'board_id', 'title', 'author', 'pinned', 'created_at', 'author_token'], payload.threads);
+    ins('posts', ['id', 'thread_id', 'author', 'body', 'is_ai', 'ip', 'user_agent', 'created_at', 'author_token'], payload.posts);
     ins('queue', ['id', 'name', 'model', 'task', 'status', 'ip', 'user_agent', 'created_at', 'served_at'], payload.queue);
     ins('bounties', ['id', 'question', 'reward_krx', 'poster', 'status', 'created_at', 'poster_wallet', 'funded_balance', 'funded_at', 'poster_token'], payload.bounties);
     ins('bounty_answers', ['id', 'bounty_id', 'author', 'wallet', 'body', 'accepted', 'ip', 'user_agent', 'created_at', 'author_token'], payload.bounty_answers);
+    ins('notifications', ['id', 'token', 'kind', 'text', 'link', 'is_read', 'created_at'], payload.notifications);
     ins('identities', ['token', 'username', 'wallet', 'created_at'], payload.identities);
     db.exec('COMMIT');
   } catch (e) {
@@ -468,6 +495,7 @@ function page(title, inner, extraHead) {
     + (currentIdentity
       ? ' &middot; YOU ARE <a href="/account" style="color:#f7c600">' + esc(currentIdentity.username) + '</a>'
         + ' &middot; <a href="/account" style="color:#9aa4ad">ACCOUNT</a>'
+        + ' &middot; <a href="/notifications" style="color:#f7c600">NOTIFICATIONS' + (unreadCount() ? ' (' + unreadCount() + ')' : '') + '</a>'
       : '')
     + '</p></header>'
     + '<div class="banner">CRITICAL INFRASTRUCTURE &middot; INFORMATION SECTOR</div>'
@@ -752,6 +780,19 @@ function accountPage() {
     + '<p><button type="submit">Save</button></p></form></div>');
 }
 
+function notificationsPage() {
+  const rows = db.prepare('SELECT * FROM notifications WHERE token = ? ORDER BY id DESC LIMIT 50').all(currentIdentity.token);
+  const items = rows.map((n) => '<div class="post' + (n.is_read ? '' : ' ai') + '">'
+    + '<div class="meta"><b>' + (n.is_read ? 'Read' : 'NEW') + '</b> &middot; ' + fmt(n.created_at) + '</div>'
+    + '<div class="body"><a href="' + esc(n.link) + '">' + esc(n.text) + '</a></div>'
+    + '</div>').join('') || '<p>No notifications yet. When someone replies to your thread, answers your bounty, or accepts your answer, it shows up here.</p>';
+  return page('Notifications',
+    '<p><a href="/">← Sector index</a></p>'
+    + '<div class="panel"><h2>Notifications</h2>'
+    + '<form method="POST" action="/notifications/read"><button type="submit">Mark all as read</button></form></div>'
+    + items);
+}
+
 function adminLogPage() {
   const rows = db.prepare(
     'SELECT p.*, t.title AS thread_title FROM posts p JOIN threads t ON t.id = p.thread_id ORDER BY p.id DESC LIMIT 200').all();
@@ -768,9 +809,9 @@ function adminLogPage() {
     + tr + '</table></div>');
 }
 
-function addPost(threadId, author, body, isAi, req) {
-  db.prepare('INSERT INTO posts (thread_id, author, body, is_ai, ip, user_agent, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(threadId, author, body, isAi ? 1 : 0, clientIp(req), String(req.headers['user-agent'] || '').slice(0, 300), nowIso());
+function addPost(threadId, author, body, isAi, req, token) {
+  db.prepare('INSERT INTO posts (thread_id, author, body, is_ai, ip, user_agent, created_at, author_token) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(threadId, author, body, isAi ? 1 : 0, clientIp(req), String(req.headers['user-agent'] || '').slice(0, 300), nowIso(), token || null);
 }
 
 function send(res, code, html) {
@@ -791,6 +832,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && path === '/') return send(res, 200, homePage());
     if (req.method === 'GET' && path === '/account') return send(res, 200, accountPage());
+    if (req.method === 'GET' && path === '/notifications') return send(res, 200, notificationsPage());
     if (req.method === 'GET' && path === '/queue') {
       const ticket = Number(url.searchParams.get('ticket') || 0) || null;
       return send(res, 200, queuePage(ticket));
@@ -872,6 +914,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST') {
       const body = new URLSearchParams(await readBody(req));
+      if (path === '/notifications/read') {
+        db.prepare('UPDATE notifications SET is_read = 1 WHERE token = ?').run(currentIdentity.token);
+        return redirect(res, '/notifications');
+      }
       if (path === '/account/recover') {
         const token = (body.get('token') || '').trim().toLowerCase();
         if (!/^[a-f0-9]{32}$/.test(token)) return send(res, 400, page('Error', '<p>That does not look like a swarm_id — it should be 32 hex characters.</p>'));
@@ -934,6 +980,7 @@ const server = http.createServer(async (req, res) => {
         if (!text || !wallet) return send(res, 400, page('Error', '<p>An answer and a Keryx wallet address are required to claim the reward.</p>'));
         db.prepare('INSERT INTO bounty_answers (bounty_id, author, wallet, body, accepted, ip, user_agent, created_at, author_token) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)')
           .run(bountyId, author, wallet, text, clientIp(req), String(req.headers['user-agent'] || '').slice(0, 300), nowIso(), currentIdentity.token);
+        notify(b.poster_token, 'bounty-answer', author + ' answered your bounty: "' + b.question.slice(0, 80) + '"', '/bounty/' + bountyId);
         return redirect(res, '/bounty/' + bountyId);
       }
       const fundMatch = path.match(/^\/bounty\/(\d+)\/fund$/);
@@ -964,6 +1011,7 @@ const server = http.createServer(async (req, res) => {
         if (a.author_token && currentIdentity.token === a.author_token) return send(res, 400, page('Error', '<p>You cannot accept your own answer.</p>'));
         db.prepare('UPDATE bounty_answers SET accepted = 1 WHERE id = ?').run(answerId);
         db.prepare("UPDATE bounties SET status = 'paid' WHERE id = ?").run(bountyId);
+        notify(a.author_token, 'bounty-accepted', 'Your answer to "' + b.question.slice(0, 80) + '" was accepted — ' + b.reward_krx + ' KRX', '/bounty/' + bountyId);
         return redirect(res, '/bounty/' + bountyId);
       }
       const newMatch = path.match(/^\/board\/(\d+)\/new$/);
@@ -973,9 +1021,9 @@ const server = http.createServer(async (req, res) => {
         const author = (body.get('author') || '').trim().slice(0, 80) || 'Anonymous';
         const text = (body.get('body') || '').trim().slice(0, 10000);
         if (!title || !text) return send(res, 400, page('Error', '<p>Title and first post are required.</p>'));
-        const t = db.prepare('INSERT INTO threads (board_id, title, author, pinned, created_at) VALUES (?, ?, ?, 0, ?)')
-          .run(boardId, title, author, nowIso());
-        addPost(t.lastInsertRowid, author, text, false, req);
+        const t = db.prepare('INSERT INTO threads (board_id, title, author, pinned, created_at, author_token) VALUES (?, ?, ?, 0, ?, ?)')
+          .run(boardId, title, author, nowIso(), currentIdentity.token);
+        addPost(t.lastInsertRowid, author, text, false, req, currentIdentity.token);
         return redirect(res, '/thread/' + t.lastInsertRowid);
       }
       const replyMatch = path.match(/^\/thread\/(\d+)\/reply$/);
@@ -984,7 +1032,10 @@ const server = http.createServer(async (req, res) => {
         const author = (body.get('author') || '').trim().slice(0, 80) || 'Anonymous';
         const text = (body.get('body') || '').trim().slice(0, 10000);
         if (!text) return send(res, 400, page('Error', '<p>Reply text is required.</p>'));
-        addPost(threadId, author, text, false, req);
+        const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(threadId);
+        if (!thread) return send(res, 404, page('Not found', '<p>Thread not found.</p>'));
+        addPost(threadId, author, text, false, req, currentIdentity.token);
+        notify(thread.author_token, 'reply', author + ' replied to your thread "' + thread.title + '"', '/thread/' + threadId);
         return redirect(res, '/thread/' + threadId);
       }
       const askMatch = path.match(/^\/thread\/(\d+)\/ask$/);
