@@ -627,6 +627,13 @@ function bountyPage(b, liveBalance) {
     + (b.status === 'paid'
       ? '<p><b>Paid.</b> The accepted answer\'s wallet was paid by the asker — this server does not send crypto itself.</p>'
       : '<p>Answer below, with your Keryx wallet address, to claim the reward if the asker accepts your answer.</p>')
+    + (!b.poster_wallet && b.status === 'open'
+      ? '<div class="panel"><h2>Fund this bounty</h2>'
+        + '<p>This bounty was posted before the proof-of-funds check. Attach a Keryx wallet to prove it is funded — the server checks the balance live, and only marks it FUNDED if the wallet holds at least ' + esc(b.reward_krx) + ' KRX.</p>'
+        + '<form method="POST" action="/bounty/' + b.id + '/fund">'
+        + '<p><input type="text" name="wallet" value="' + esc(currentIdentity.wallet) + '" placeholder="Your Keryx wallet address (keryx:…)" required></p>'
+        + '<p><button type="submit">Prove funding</button></p></form></div>'
+      : '')
     + '</div>'
     + ansHtml
     + (b.status === 'open'
@@ -805,6 +812,20 @@ const server = http.createServer(async (req, res) => {
         if (!text || !wallet) return send(res, 400, page('Error', '<p>An answer and a Keryx wallet address are required to claim the reward.</p>'));
         db.prepare('INSERT INTO bounty_answers (bounty_id, author, wallet, body, accepted, ip, user_agent, created_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)')
           .run(bountyId, author, wallet, text, clientIp(req), String(req.headers['user-agent'] || '').slice(0, 300), nowIso());
+        return redirect(res, '/bounty/' + bountyId);
+      }
+      const fundMatch = path.match(/^\/bounty\/(\d+)\/fund$/);
+      if (fundMatch) {
+        const bountyId = Number(fundMatch[1]);
+        const b = db.prepare('SELECT * FROM bounties WHERE id = ?').get(bountyId);
+        if (!b || b.status !== 'open' || b.poster_wallet) return send(res, 400, page('Error', '<p>This bounty cannot be funded.</p>'));
+        const wallet = (body.get('wallet') || '').trim().slice(0, 120);
+        if (!wallet.startsWith('keryx:')) return send(res, 400, page('Error', '<p>A Keryx wallet address (starting keryx:) is required.</p>'));
+        const balance = await keryxBalance(wallet);
+        if (balance === null) return send(res, 400, page('Error', '<p>Could not check that wallet against the Keryx API. Check the address and try again.</p>'));
+        if (balance < b.reward_krx) return send(res, 400, page('Error', '<p>That wallet holds only ' + balance.toFixed(2) + ' KRX, less than the ' + b.reward_krx + ' KRX reward.</p>'));
+        db.prepare('UPDATE bounties SET poster_wallet = ?, funded_balance = ?, funded_at = ? WHERE id = ?')
+          .run(wallet, balance, nowIso(), bountyId);
         return redirect(res, '/bounty/' + bountyId);
       }
       const accMatch = path.match(/^\/bounty\/(\d+)\/accept$/);
