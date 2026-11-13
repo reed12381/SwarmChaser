@@ -141,9 +141,23 @@ async function initSchema() {
     result_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS votes (
+    id SERIAL PRIMARY KEY,
+    target_type TEXT NOT NULL,
+    target_id INTEGER NOT NULL,
+    voter_token TEXT NOT NULL,
+    vote INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (target_type, target_id, voter_token)
+  );
   `);
   // Bounty funding columns (added after launch, so ALTER, not CREATE).
   for (const [col, type] of [['poster_wallet', 'TEXT'], ['funded_balance', 'REAL'], ['funded_at', 'TEXT']]) {
+    await pool.query(`ALTER TABLE bounties ADD COLUMN IF NOT EXISTS ${col} ${type}`);
+  }
+  // Accepted-but-unpaid tracking: accept moves a bounty to 'accepted', and
+  // only on-chain verification moves it to 'paid' (see verifyBountyPayment).
+  for (const [col, type] of [['accepted_at', 'TEXT'], ['accepted_answer_id', 'INTEGER'], ['payment_txid', 'TEXT']]) {
     await pool.query(`ALTER TABLE bounties ADD COLUMN IF NOT EXISTS ${col} ${type}`);
   }
   // Accept-authorization columns: who posted the bounty and who wrote each
@@ -241,6 +255,7 @@ async function exportPayload() {
     notifications: await getAll('SELECT * FROM notifications ORDER BY id', []),
     identities: await getAll('SELECT token, username, wallet, created_at FROM identities ORDER BY created_at', []),
     lookups: await getAll('SELECT * FROM lookups ORDER BY id', []),
+    votes: await getAll('SELECT * FROM votes ORDER BY id', []),
   };
 }
 async function backupNow() {
@@ -274,14 +289,15 @@ async function restoreFromBackup(payload) {
     await ins('threads', 'id', ['id', 'board_id', 'title', 'author', 'pinned', 'created_at', 'author_token'], payload.threads);
     await ins('posts', 'id', ['id', 'thread_id', 'author', 'body', 'is_ai', 'ip', 'user_agent', 'created_at', 'author_token'], payload.posts);
     await ins('queue', 'id', ['id', 'name', 'model', 'task', 'status', 'ip', 'user_agent', 'created_at', 'served_at'], payload.queue);
-    await ins('bounties', 'id', ['id', 'question', 'reward_krx', 'poster', 'status', 'created_at', 'poster_wallet', 'funded_balance', 'funded_at', 'poster_token'], payload.bounties);
+    await ins('bounties', 'id', ['id', 'question', 'reward_krx', 'poster', 'status', 'created_at', 'poster_wallet', 'funded_balance', 'funded_at', 'poster_token', 'accepted_at', 'accepted_answer_id', 'payment_txid'], payload.bounties);
     await ins('bounty_answers', 'id', ['id', 'bounty_id', 'author', 'wallet', 'body', 'accepted', 'ip', 'user_agent', 'created_at', 'author_token'], payload.bounty_answers);
     await ins('notifications', 'id', ['id', 'token', 'kind', 'text', 'link', 'is_read', 'created_at'], payload.notifications);
     await ins('identities', 'token', ['token', 'username', 'wallet', 'created_at'], payload.identities);
     await ins('lookups', 'id', ['id', 'query', 'source', 'result_count', 'created_at'], payload.lookups);
+    await ins('votes', 'id', ['id', 'target_type', 'target_id', 'voter_token', 'vote', 'created_at'], payload.votes);
     // Restored rows carry explicit ids, so move each SERIAL sequence past
     // the max id — otherwise the next insert would collide on id 1.
-    for (const t of ['boards', 'threads', 'posts', 'queue', 'bounties', 'bounty_answers', 'notifications', 'lookups']) {
+    for (const t of ['boards', 'threads', 'posts', 'queue', 'bounties', 'bounty_answers', 'notifications', 'lookups', 'votes']) {
       await client.query("SELECT setval(pg_get_serial_sequence($1, 'id'), COALESCE((SELECT MAX(id) FROM " + t + "), 1))", [t]);
     }
     await client.query('COMMIT');
@@ -370,6 +386,62 @@ async function keryxBalance(wallet) {
     if (typeof j.balance_sompi === 'number') return j.balance_sompi / 1e8;
     return null;
   } catch (e) { return null; }
+}
+async function keryxUtxos(wallet) {
+  try {
+    const r = await fetch('https://keryx-labs.com/api/v1/addresses/' + encodeURIComponent(wallet) + '/utxos',
+      { signal: AbortSignal.timeout(15000) });
+    const j = await r.json();
+    return Array.isArray(j) ? j : null;
+  } catch (e) { return null; }
+}
+async function keryxTx(txid) {
+  try {
+    const r = await fetch('https://keryx-labs.com/api/v1/transactions/' + encodeURIComponent(txid),
+      { signal: AbortSignal.timeout(15000) });
+    const j = await r.json();
+    return (j && !j.error) ? j : null;
+  } catch (e) { return null; }
+}
+// Verify an accepted bounty was actually paid on-chain: find a UTXO of
+// exactly the reward in the answerer's wallet whose transaction has an
+// input from the poster's wallet. Returns the tx id or null. Best-effort —
+// null means "not found or API unavailable", never an error.
+async function verifyBountyPayment(b) {
+  try {
+    const a = b.accepted_answer_id
+      ? await getOne('SELECT * FROM bounty_answers WHERE id = $1', [b.accepted_answer_id])
+      : null;
+    if (!a || !a.wallet || !b.poster_wallet) return null;
+    const want = Math.round(b.reward_krx * 1e8);
+    const utxos = await keryxUtxos(a.wallet);
+    if (!utxos) return null;
+    const cands = utxos.filter((u) => u.amount_sompi === want).slice(0, 3);
+    for (const u of cands) {
+      const tx = await keryxTx(u.transaction_id);
+      if (tx && Array.isArray(tx.inputs) && tx.inputs.some((i) => i.address === b.poster_wallet)) return u.transaction_id;
+    }
+    return null;
+  } catch (e) { return null; }
+}
+// Check a pasted receipt: the tx must have an output of exactly the reward
+// to the answerer's wallet, after the bounty was accepted. The tx id is
+// stored and shown, so anyone can check it themselves.
+async function verifyReceiptTx(b, txid) {
+  try {
+    const a = b.accepted_answer_id
+      ? await getOne('SELECT * FROM bounty_answers WHERE id = $1', [b.accepted_answer_id])
+      : null;
+    if (!a || !a.wallet) return false;
+    const tx = await keryxTx(txid);
+    if (!tx || tx.is_accepted === false || !Array.isArray(tx.outputs)) return false;
+    const want = Math.round(b.reward_krx * 1e8);
+    if (!tx.outputs.some((o) => o.address === a.wallet && o.amount_sompi === want)) return false;
+    if (b.accepted_at && tx.block && tx.block.timestamp_ms) {
+      if (tx.block.timestamp_ms < Date.parse(b.accepted_at)) return false;
+    }
+    return true;
+  } catch (e) { return false; }
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -522,6 +594,74 @@ async function logLookup(query, outcome) {
   } catch (e) { /* history is best-effort, never break a lookup */ }
 }
 
+// ------------------------------------------------------------------- reputation
+// Reputation is two numbers, both earned, neither self-granted:
+//   - KRX actually paid: SUM of rewards on bounties this identity posted
+//     that reached verified 'paid' (on-chain, see verifyBountyPayment).
+//   - Votes: up/downvotes other users gave this identity's posts and
+//     bounty answers. Self-votes are blocked at the /vote route, so the
+//     totals here only ever reflect other users.
+async function reputationFor(token) {
+  if (!token) return { krxPaid: 0, bountiesPaid: 0, up: 0, down: 0 };
+  const krx = await getOne(
+    "SELECT COALESCE(SUM(reward_krx),0)::float AS krx, COUNT(*)::int AS n FROM bounties WHERE poster_token = $1 AND status = 'paid'", [token]);
+  const v = await getOne(
+    "SELECT COALESCE(SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END),0)::int AS up, COALESCE(SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END),0)::int AS down "
+    + "FROM votes WHERE (target_type = 'post' AND target_id IN (SELECT id FROM posts WHERE author_token = $1)) "
+    + "OR (target_type = 'answer' AND target_id IN (SELECT id FROM bounty_answers WHERE author_token = $1))", [token]);
+  return { krxPaid: krx.krx, bountiesPaid: krx.n, up: v.up, down: v.down };
+}
+function fmtKrx(n) {
+  const s = Number(n).toFixed(2);
+  return s.replace(/\.00$/, '');
+}
+function repLine(rep) {
+  const parts = [];
+  if (rep.krxPaid > 0) parts.push(fmtKrx(rep.krxPaid) + ' KRX paid' + (rep.bountiesPaid ? ' (' + rep.bountiesPaid + ' ' + (rep.bountiesPaid === 1 ? 'bounty' : 'bounties') + ')' : ''));
+  if (rep.up || rep.down) parts.push('+' + rep.up + ' / −' + rep.down);
+  return parts.length ? parts.join(' · ') : '';
+}
+async function voteCountsFor(targetType, ids) {
+  if (!ids.length) return {};
+  const rows = await getAll(
+    "SELECT target_id, COALESCE(SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END),0)::int AS up, COALESCE(SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END),0)::int AS down "
+    + "FROM votes WHERE target_type = $1 AND target_id = ANY($2) GROUP BY target_id", [targetType, ids]);
+  const out = {};
+  for (const r of rows) out[r.target_id] = { up: r.up, down: r.down };
+  return out;
+}
+async function myVotesFor(targetType, ids) {
+  if (!ids.length || !currentIdentity) return {};
+  const rows = await getAll(
+    'SELECT target_id, vote FROM votes WHERE target_type = $1 AND voter_token = $2 AND target_id = ANY($3)',
+    [targetType, currentIdentity.token, ids]);
+  const out = {};
+  for (const r of rows) out[r.target_id] = r.vote;
+  return out;
+}
+// Vote buttons for one post/answer. Clicking your current vote again removes
+// it. The target author's own vote buttons are never rendered for them —
+// and the /vote route blocks it server-side too.
+function voteForm(targetType, targetId, counts, myVote, next) {
+  const c = counts || { up: 0, down: 0 };
+  const upMark = myVote === 1 ? ' <b>◀ yours</b>' : '';
+  const downMark = myVote === -1 ? ' <b>◀ yours</b>' : '';
+  return '<div style="font-size:13px;margin-top:6px">'
+    + '<form method="POST" action="/vote" style="display:inline">'
+    + '<input type="hidden" name="target_type" value="' + esc(targetType) + '">'
+    + '<input type="hidden" name="target_id" value="' + targetId + '">'
+    + '<input type="hidden" name="vote" value="1">'
+    + '<input type="hidden" name="next" value="' + esc(next) + '">'
+    + '<button type="submit">▲ ' + c.up + '</button></form>' + upMark + ' '
+    + '<form method="POST" action="/vote" style="display:inline">'
+    + '<input type="hidden" name="target_type" value="' + esc(targetType) + '">'
+    + '<input type="hidden" name="target_id" value="' + targetId + '">'
+    + '<input type="hidden" name="vote" value="-1">'
+    + '<input type="hidden" name="next" value="' + esc(next) + '">'
+    + '<button type="submit">▼ ' + c.down + '</button></form>' + downMark
+    + '</div>';
+}
+
 // ------------------------------------------------------------------- layout
 const CSS = `
 * { box-sizing: border-box; }
@@ -657,10 +797,25 @@ async function boardPage(board) {
 async function threadPage(thread) {
   const board = await getOne('SELECT * FROM boards WHERE id = $1', [thread.board_id]);
   const posts = await getAll('SELECT * FROM posts WHERE thread_id = $1 ORDER BY id', [thread.id]);
-  const postHtml = posts.map((p) => '<div class="post' + (p.is_ai ? ' ai' : '') + '">'
-    + '<div class="meta"><b>' + esc(p.author) + '</b>' + (p.is_ai ? ' — LOOKUP REPLY' : '')
-    + ' &middot; ' + fmt(p.created_at) + '</div>'
-    + '<div class="body">' + esc(p.body) + '</div></div>').join('');
+  const postIds = posts.map((p) => p.id);
+  const counts = await voteCountsFor('post', postIds);
+  const mine = await myVotesFor('post', postIds);
+  const reps = {};
+  for (const p of posts) {
+    if (p.author_token && !reps[p.author_token]) reps[p.author_token] = await reputationFor(p.author_token);
+  }
+  const postHtml = posts.map((p) => {
+    const rep = p.author_token && reps[p.author_token] ? repLine(reps[p.author_token]) : '';
+    const isMine = p.author_token && currentIdentity && p.author_token === currentIdentity.token;
+    const c = counts[p.id] || { up: 0, down: 0 };
+    const votes = isMine
+      ? '<div style="font-size:13px;margin-top:6px">▲ ' + c.up + ' &nbsp; ▼ ' + c.down + ' &nbsp; <span style="color:#666">(your post — you cannot vote on it)</span></div>'
+      : voteForm('post', p.id, c, mine[p.id], '/thread/' + thread.id);
+    return '<div class="post' + (p.is_ai ? ' ai' : '') + '">'
+      + '<div class="meta"><b>' + esc(p.author) + '</b>' + (p.is_ai ? ' — LOOKUP REPLY' : '')
+      + ' &middot; ' + fmt(p.created_at) + (rep ? ' &middot; ' + esc(rep) : '') + '</div>'
+      + '<div class="body">' + esc(p.body) + '</div>' + votes + '</div>';
+  }).join('');
   return await page(thread.title,
     '<p><a href="/">← Sector index</a> &middot; <a href="/board/' + board.id + '">← ' + esc(board.name) + '</a></p>'
     + '<h2 style="letter-spacing:1px">' + (thread.pinned ? '<span class="pinned">[PINNED] </span>' : '') + esc(thread.title) + '</h2>'
@@ -757,17 +912,27 @@ async function bountiesPage() {
   const open = await getAll(
     "SELECT b.*, (SELECT COUNT(*)::int FROM bounty_answers WHERE bounty_id = b.id) AS n "
     + "FROM bounties b WHERE status = 'open' ORDER BY id DESC", []);
+  const awaiting = await getAll(
+    "SELECT b.*, (SELECT COUNT(*)::int FROM bounty_answers WHERE bounty_id = b.id) AS n "
+    + "FROM bounties b WHERE status = 'accepted' ORDER BY id DESC", []);
   const closed = await getAll(
     "SELECT b.*, (SELECT COUNT(*)::int FROM bounty_answers WHERE bounty_id = b.id) AS n "
-    + "FROM bounties b WHERE status != 'open' ORDER BY id DESC LIMIT 20", []);
-  const row = (b) => {
+    + "FROM bounties b WHERE status = 'paid' ORDER BY id DESC LIMIT 20", []);
+  const statusLabel = (b) => b.status === 'accepted' ? 'accepted — awaiting payment' : b.status;
+  const row = async (b) => {
     const n = b.n;
+    const rep = b.poster_token ? repLine(await reputationFor(b.poster_token)) : '';
     return '<div class="threadrow"><span><a href="/bounty/' + b.id + '">' + esc(b.question) + '</a><br>'
-      + '<span style="font-size:12px;color:#666">by ' + esc(b.poster) + ' &middot; ' + fmt(b.created_at)
+      + '<span style="font-size:12px;color:#666">by ' + esc(b.poster) + (rep ? ' &middot; ' + esc(rep) : '') + ' &middot; ' + fmt(b.created_at)
       + ' &middot; ' + n + ' answer' + (n === 1 ? '' : 's') + '</span></span>'
       + '<span style="white-space:nowrap"><b>' + esc(b.reward_krx) + ' KRX</b><br>'
-      + '<span style="font-size:12px">' + esc(b.status) + '</span><br>'
+      + '<span style="font-size:12px">' + esc(statusLabel(b)) + '</span><br>'
       + '<span style="font-size:12px">' + (b.poster_wallet ? 'FUNDED' : 'UNVERIFIED') + '</span></span></div>';
+  };
+  const rows = async (list) => {
+    let out = '';
+    for (const b of list) out += await row(b);
+    return out;
   };
   return await page('Bounty board',
     '<p><a href="/">← Sector index</a></p>'
@@ -783,10 +948,17 @@ async function bountiesPage() {
     + 'holds the reward plus ~1 KRX to cover the network fee when it is paid — a wallet holding '
     + 'exactly the reward could not actually pay it. A bounty marked <b>FUNDED</b> held the money when it was posted. '
     + 'That is a snapshot, not a lock — the poster can spend afterwards, so the bounty page re-checks '
-    + 'the wallet on every load. A bounty marked <b>UNVERIFIED</b> was posted before this check existed.</p></div>'
+    + 'the wallet on every load. A bounty marked <b>UNVERIFIED</b> was posted before this check existed.</p>'
+    + '<p><b>Reputation:</b> every poster carries one, and it is earned, not claimed. '
+    + 'It shows KRX actually paid on past bounties — verified on-chain, not just promised — '
+    + 'plus up/downvotes other users gave their posts and answers. Check it before you answer: '
+    + 'a poster who has stiffed people wears it. And you cannot vote on your own posts, so nobody can inflate their own reputation.</p>'
+    + '<p>When the asker accepts an answer, the bounty moves to <b>accepted — awaiting payment</b> until the server sees the KRX move on-chain to the answerer\'s wallet. Only then is it <b>paid</b>. '
+    + 'If the asker already paid, they can paste the transaction ID on the bounty page and the server verifies it.</p></div>'
     + '<h2 style="letter-spacing:1px">OPEN</h2>'
-    + (open.map(row).join('') || '<p>No open bounties. Post one below.</p>')
-    + (closed.length ? '<h2 style="letter-spacing:1px">CLOSED</h2>' + closed.map(row).join('') : '')
+    + (await rows(open) || '<p>No open bounties. Post one below.</p>')
+    + (awaiting.length ? '<h2 style="letter-spacing:1px">AWAITING PAYMENT</h2>' + await rows(awaiting) : '')
+    + (closed.length ? '<h2 style="letter-spacing:1px">PAID</h2>' + await rows(closed) : '')
     + '<div class="panel"><h2>Post a bounty</h2>'
     + '<form method="POST" action="/bounties/new">'
     + '<p><input type="text" name="poster" value="' + esc(currentIdentity.username) + '" required></p>'
@@ -804,29 +976,61 @@ async function bountyPage(b, liveBalance) {
         ? '<b>FUNDED</b> — wallet ' + esc(b.poster_wallet) + ' holds ' + esc(liveBalance.toFixed(2)) + ' KRX right now (≥ ' + esc(b.reward_krx) + ' KRX reward + ~1 KRX network fee)'
         : '<b>UNFUNDED — balance dropped</b> — wallet ' + esc(b.poster_wallet) + ' holds only ' + esc(liveBalance.toFixed(2)) + ' KRX now, below the ' + esc(b.reward_krx) + ' KRX reward + ~1 KRX fee'))
     : '<b>UNVERIFIED</b> — posted before the proof-of-funds check existed; no wallet on record';
+  const posterRep = b.poster_token ? repLine(await reputationFor(b.poster_token)) : '';
+  const statusLabel = b.status === 'accepted' ? 'accepted — awaiting payment' : b.status;
+  const isPoster = b.poster_token && currentIdentity && currentIdentity.token === b.poster_token;
   const answers = await getAll('SELECT * FROM bounty_answers WHERE bounty_id = $1 ORDER BY id', [b.id]);
+  const ansIds = answers.map((a) => a.id);
+  const ansCounts = await voteCountsFor('answer', ansIds);
+  const ansMine = await myVotesFor('answer', ansIds);
+  const ansReps = {};
+  for (const a of answers) {
+    if (a.author_token && !ansReps[a.author_token]) ansReps[a.author_token] = await reputationFor(a.author_token);
+  }
   const canAccept = (a) => !a.accepted && b.status === 'open'
     && (!b.poster_token || currentIdentity.token === b.poster_token)
     && (!a.author_token || currentIdentity.token !== a.author_token);
-  const ansHtml = answers.map((a) => '<div class="post' + (a.accepted ? ' ai' : '') + '">'
-    + '<div class="meta"><b>' + esc(a.author) + '</b>' + (a.accepted ? ' — ACCEPTED' : '')
-    + ' &middot; ' + fmt(a.created_at)
-    + (a.wallet ? '<br>Wallet: ' + esc(a.wallet) : '') + '</div>'
-    + '<div class="body">' + esc(a.body) + '</div>'
-    + (canAccept(a)
-      ? '<form method="POST" action="/bounty/' + b.id + '/accept" style="margin-top:8px">'
-        + '<input type="hidden" name="answer_id" value="' + a.id + '">'
-        + '<button type="submit">Accept this answer — pay ' + esc(b.reward_krx) + ' KRX to ' + esc(a.wallet || 'the author') + '</button></form>'
-      : '')
-    + '</div>').join('') || '<p>No answers yet.</p>';
+  let ansHtml = '';
+  for (const a of answers) {
+    const rep = a.author_token && ansReps[a.author_token] ? repLine(ansReps[a.author_token]) : '';
+    const isMine = a.author_token && currentIdentity && a.author_token === currentIdentity.token;
+    const c = ansCounts[a.id] || { up: 0, down: 0 };
+    const votes = isMine
+      ? '<div style="font-size:13px;margin-top:6px">▲ ' + c.up + ' &nbsp; ▼ ' + c.down + ' &nbsp; <span style="color:#666">(your answer — you cannot vote on it)</span></div>'
+      : voteForm('answer', a.id, c, ansMine[a.id], '/bounty/' + b.id);
+    ansHtml += '<div class="post' + (a.accepted ? ' ai' : '') + '">'
+      + '<div class="meta"><b>' + esc(a.author) + '</b>' + (a.accepted ? ' — ACCEPTED' : '')
+      + ' &middot; ' + fmt(a.created_at) + (rep ? ' &middot; ' + esc(rep) : '')
+      + (a.wallet ? '<br>Wallet: ' + esc(a.wallet) : '') + '</div>'
+      + '<div class="body">' + esc(a.body) + '</div>' + votes
+      + (canAccept(a)
+        ? '<form method="POST" action="/bounty/' + b.id + '/accept" style="margin-top:8px">'
+          + '<input type="hidden" name="answer_id" value="' + a.id + '">'
+          + '<button type="submit">Accept this answer — pay ' + esc(b.reward_krx) + ' KRX to ' + esc(a.wallet || 'the author') + '</button></form>'
+        : '')
+      + '</div>';
+  }
+  if (!ansHtml) ansHtml = '<p>No answers yet.</p>';
   return await page('Bounty: ' + b.question,
     '<p><a href="/">← Sector index</a> &middot; <a href="/bounties">← Bounty board</a></p>'
     + '<div class="panel"><h2>' + esc(b.question) + '</h2>'
     + '<p>Reward: <b>' + esc(b.reward_krx) + ' KRX</b> &middot; Posted by ' + esc(b.poster)
-    + ' &middot; ' + fmt(b.created_at) + ' &middot; Status: <b>' + esc(b.status) + '</b><br>' + funded + '</p>'
+    + (posterRep ? ' &middot; ' + esc(posterRep) : '')
+    + ' &middot; ' + fmt(b.created_at) + ' &middot; Status: <b>' + esc(statusLabel) + '</b><br>' + funded + '</p>'
     + (b.status === 'paid'
-      ? '<p><b>Paid.</b> The accepted answer\'s wallet was paid by the asker — this server does not send crypto itself.</p>'
-      : '<p>Answer below, with your Keryx wallet address, to claim the reward if the asker accepts your answer.</p>')
+      ? (b.payment_txid
+        ? '<p><b>Paid — verified on-chain.</b> Transaction <code>' + esc(b.payment_txid) + '</code> moved ' + esc(b.reward_krx) + ' KRX to the accepted answer\'s wallet. This server does not send crypto itself — it only checks the chain.</p>'
+        : '<p><b>Paid.</b> The accepted answer\'s wallet was paid by the asker — this server does not send crypto itself.</p>')
+      : b.status === 'accepted'
+        ? '<p><b>Accepted — awaiting payment.</b> The asker accepted an answer. This bounty becomes <b>paid</b> once the server sees the ' + esc(b.reward_krx) + ' KRX move on-chain to the answerer\'s wallet — this page checks on every load.</p>'
+          + (isPoster
+            ? '<div class="panel"><h2>Already paid? Paste the receipt</h2>'
+              + '<p>If you already sent the KRX, paste the transaction ID and the server will verify it against the chain — the answerer\'s wallet must show exactly ' + esc(b.reward_krx) + ' KRX from that transaction.</p>'
+              + '<form method="POST" action="/bounty/' + b.id + '/receipt">'
+              + '<p><input type="text" name="txid" placeholder="Transaction ID (64 hex characters)" required></p>'
+              + '<p><button type="submit">Verify payment</button></p></form></div>'
+            : '')
+        : '<p>Answer below, with your Keryx wallet address, to claim the reward if the asker accepts your answer.</p>')
     + (!b.poster_wallet && b.status === 'open'
       ? '<div class="panel"><h2>Fund this bounty</h2>'
         + '<p>This bounty was posted before the proof-of-funds check. Attach a Keryx wallet to prove it is funded — the server checks the balance live, and only marks it FUNDED if the wallet holds the reward plus ~1 KRX to cover the network fee.</p>'
@@ -848,8 +1052,14 @@ async function bountyPage(b, liveBalance) {
 
 async function accountPage() {
   const id = currentIdentity;
+  const rep = repLine(await reputationFor(id.token));
   return await page('Account',
     '<p><a href="/">← Sector index</a></p>'
+    + '<div class="panel"><h2>Your reputation</h2>'
+    + (rep
+      ? '<p>' + esc(rep) + ' — KRX paid is verified on-chain from bounties you posted and paid; votes come from other users on your posts and answers. You cannot vote on your own content.</p>'
+      : '<p>No reputation yet — post a bounty and pay it, or write posts and answers other users upvote. You cannot vote on your own content.</p>')
+    + '</div>'
     + '<div class="panel"><h2>Your account</h2>'
     + '<p>No password, no email. This forum remembers you by a cookie in your browser '
     + '(<code>swarm_id</code>, good for a year). Your session ID is '
@@ -932,6 +1142,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && bountyMatch) {
       const b = await getOne('SELECT * FROM bounties WHERE id = $1', [Number(bountyMatch[1])]);
       if (!b) return send(res, 404, await page('Not found', '<p>Bounty not found.</p>'));
+      // An accepted bounty is re-checked against the chain on every load,
+      // so it flips to paid the moment the payment lands.
+      if (b.status === 'accepted') {
+        const txid = await verifyBountyPayment(b);
+        if (txid) {
+          await runStmt("UPDATE bounties SET status = 'paid', payment_txid = $1 WHERE id = $2", [txid, b.id]);
+          b.status = 'paid';
+          b.payment_txid = txid;
+        }
+      }
       const liveBalance = b.poster_wallet ? await keryxBalance(b.poster_wallet) : null;
       return send(res, 200, await bountyPage(b, liveBalance));
     }
@@ -955,6 +1175,7 @@ const server = http.createServer(async (req, res) => {
         bounties: await getAll('SELECT * FROM bounties ORDER BY id', []),
         bounty_answers: await getAll('SELECT * FROM bounty_answers ORDER BY id', []),
         lookups: await getAll('SELECT * FROM lookups ORDER BY id', []),
+        votes: await getAll('SELECT * FROM votes ORDER BY id', []),
       };
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
@@ -1010,6 +1231,29 @@ const server = http.createServer(async (req, res) => {
       if (path === '/notifications/read') {
         await runStmt('UPDATE notifications SET is_read = 1 WHERE token = $1', [currentIdentity.token]);
         return await redirect(res, '/notifications');
+      }
+      // Up/downvote a post or a bounty answer. One vote per user per target;
+      // clicking your current vote again removes it. Self-votes are blocked
+      // here, server-side — the buttons are not rendered for your own
+      // content either, but the route is the enforcement, not the UI.
+      if (path === '/vote') {
+        const targetType = body.get('target_type') === 'answer' ? 'answer' : 'post';
+        const targetId = Number(body.get('target_id') || 0);
+        const vote = body.get('vote') === '-1' ? -1 : 1;
+        const next = (body.get('next') || '/').slice(0, 200);
+        const target = targetType === 'post'
+          ? await getOne('SELECT * FROM posts WHERE id = $1', [targetId])
+          : await getOne('SELECT * FROM bounty_answers WHERE id = $1', [targetId]);
+        if (!target) return send(res, 400, await page('Error', '<p>Nothing to vote on.</p>'));
+        if (target.author_token && target.author_token === currentIdentity.token)
+          return send(res, 400, await page('Error', '<p>You cannot vote on your own post — reputation has to come from other users.</p>'));
+        const existing = await getOne('SELECT * FROM votes WHERE target_type = $1 AND target_id = $2 AND voter_token = $3', [targetType, targetId, currentIdentity.token]);
+        if (existing && existing.vote === vote) {
+          await runStmt('DELETE FROM votes WHERE id = $1', [existing.id]);
+        } else {
+          await runStmt('INSERT INTO votes (target_type, target_id, voter_token, vote, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (target_type, target_id, voter_token) DO UPDATE SET vote = EXCLUDED.vote', [targetType, targetId, currentIdentity.token, vote, nowIso()]);
+        }
+        return await redirect(res, next.startsWith('/') ? next : '/');
       }
       if (path === '/account/recover') {
         const token = (body.get('token') || '').trim().toLowerCase();
@@ -1098,8 +1342,29 @@ const server = http.createServer(async (req, res) => {
         if (b.poster_token && currentIdentity.token !== b.poster_token) return send(res, 400, await page('Error', '<p>Only the bounty poster can accept an answer.</p>'));
         if (a.author_token && currentIdentity.token === a.author_token) return send(res, 400, await page('Error', '<p>You cannot accept your own answer.</p>'));
         await runStmt('UPDATE bounty_answers SET accepted = 1 WHERE id = $1', [answerId]);
-        await runStmt("UPDATE bounties SET status = 'paid' WHERE id = $1", [bountyId]);
+        // Accept is not paid yet: the bounty moves to 'accepted' and only
+        // becomes 'paid' when the server sees the KRX move on-chain. The
+        // poster may have already paid, so check the chain right away.
+        const acceptedAt = nowIso();
+        await runStmt("UPDATE bounties SET status = 'accepted', accepted_at = $1, accepted_answer_id = $2 WHERE id = $3", [acceptedAt, answerId, bountyId]);
+        const txid = await verifyBountyPayment({ ...b, status: 'accepted', accepted_at: acceptedAt, accepted_answer_id: answerId });
+        if (txid) await runStmt("UPDATE bounties SET status = 'paid', payment_txid = $1 WHERE id = $2", [txid, bountyId]);
         await notify(a.author_token, 'bounty-accepted', 'Your answer to "' + b.question.slice(0, 80) + '" was accepted — ' + b.reward_krx + ' KRX', '/bounty/' + bountyId);
+        return await redirect(res, '/bounty/' + bountyId);
+      }
+      const recMatch = path.match(/^\/bounty\/(\d+)\/receipt$/);
+      if (recMatch) {
+        const bountyId = Number(recMatch[1]);
+        const b = await getOne('SELECT * FROM bounties WHERE id = $1', [bountyId]);
+        const txid = (body.get('txid') || '').trim().toLowerCase();
+        if (!b || b.status !== 'accepted' || !/^[a-f0-9]{64}$/.test(txid))
+          return send(res, 400, await page('Error', '<p>That does not look like a transaction ID — it should be 64 hex characters, and the bounty must be accepted and awaiting payment.</p>'));
+        if (b.poster_token && currentIdentity.token !== b.poster_token)
+          return send(res, 400, await page('Error', '<p>Only the bounty poster can submit a payment receipt.</p>'));
+        const ok = await verifyReceiptTx(b, txid);
+        if (!ok)
+          return send(res, 400, await page('Error', '<p>No matching payment found for that transaction — it must send exactly ' + esc(b.reward_krx) + ' KRX to the accepted answer\'s wallet, after the answer was accepted. Check the transaction ID and try again.</p>'));
+        await runStmt("UPDATE bounties SET status = 'paid', payment_txid = $1 WHERE id = $2", [txid, bountyId]);
         return await redirect(res, '/bounty/' + bountyId);
       }
       const newMatch = path.match(/^\/board\/(\d+)\/new$/);
