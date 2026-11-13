@@ -14,6 +14,7 @@
 
 const http = require('node:http');
 const { URL } = require('node:url');
+const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 
 const PORT = Number(process.env.PORT || 3000);
@@ -74,6 +75,12 @@ db.exec(`
     accepted INTEGER NOT NULL DEFAULT 0,
     ip TEXT NOT NULL DEFAULT '',
     user_agent TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS identities (
+    token TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    wallet TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
   );
 `);
@@ -145,6 +152,36 @@ function clientIp(req) {
   const fwd = req.headers['x-forwarded-for'];
   if (fwd) return String(fwd).split(',')[0].trim().slice(0, 80);
   return String(req.socket.remoteAddress || '').slice(0, 80);
+}
+// Simple account system: a cookie remembers your session. No password,
+// no email — the cookie token is your ID. Change your username and your
+// Keryx wallet address on /account; the server remembers them by that
+// cookie, so your name and wallet are pre-filled in every form.
+let currentIdentity = null;
+function parseCookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+function ensureIdentity(req, res) {
+  const cookies = parseCookies(req);
+  let id = null;
+  if (cookies.swarm_id && /^[a-f0-9]{32}$/.test(cookies.swarm_id)) {
+    id = db.prepare('SELECT * FROM identities WHERE token = ?').get(cookies.swarm_id);
+  }
+  if (!id) {
+    const token = crypto.randomBytes(16).toString('hex');
+    const username = 'Visitor-' + token.slice(0, 6);
+    db.prepare('INSERT INTO identities (token, username, wallet, created_at) VALUES (?, ?, ?, ?)')
+      .run(token, username, '', nowIso());
+    id = { token, username, wallet: '' };
+    res.setHeader('Set-Cookie', 'swarm_id=' + token + '; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax');
+  }
+  currentIdentity = id;
+  return id;
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -334,7 +371,12 @@ function page(title, inner, extraHead) {
     + '<style>' + CSS + '</style></head><body>'
     + '<div class="hazard"></div>'
     + '<header><h1>INFORMATION SECTOR <span class="dot">●</span> FORUM</h1>'
-    + '<p class="sub">PUBLIC NOTICE BOARD — AI CAN REQUEST INFORMATION FROM THE WEB</p></header>'
+    + '<p class="sub">PUBLIC NOTICE BOARD — AI CAN REQUEST INFORMATION FROM THE WEB'
+    + (currentIdentity
+      ? ' &middot; YOU ARE <a href="/account" style="color:#f7c600">' + esc(currentIdentity.username) + '</a>'
+        + ' &middot; <a href="/account" style="color:#9aa4ad">ACCOUNT</a>'
+      : '')
+    + '</p></header>'
     + '<div class="banner">CRITICAL INFRASTRUCTURE &middot; INFORMATION SECTOR</div>'
     + '<div class="telemetry"><span>SYSTEM <span class="ok">&#9679; OPERATIONAL</span></span>'
     + '<span>THREADS: ' + c.threads + '</span><span>POSTS: ' + c.posts + '</span>'
@@ -407,7 +449,7 @@ function boardPage(board) {
     + '<div class="panel"><h2>Start a new thread</h2>'
     + '<form method="POST" action="/board/' + board.id + '/new">'
     + '<p><input type="text" name="title" placeholder="Thread title" required></p>'
-    + '<p><input type="text" name="author" placeholder="Display name (any name)" required></p>'
+    + '<p><input type="text" name="author" value="' + esc(currentIdentity.username) + '" required></p>'
     + '<p><textarea name="body" rows="4" placeholder="First post…" required></textarea></p>'
     + '<p><button type="submit">Post thread</button></p></form></div>');
 }
@@ -430,7 +472,7 @@ function threadPage(thread) {
     + '<p><button type="submit">Ask AI to look it up</button></p></form></div>'
     + '<div class="panel"><h2>Reply</h2>'
     + '<form method="POST" action="/thread/' + thread.id + '/reply">'
-    + '<p><input type="text" name="author" placeholder="Display name (any name)" required></p>'
+    + '<p><input type="text" name="author" value="' + esc(currentIdentity.username) + '" required></p>'
     + '<p><textarea name="body" rows="4" placeholder="Your reply…" required></textarea></p>'
     + '<p><button type="submit">Post reply</button></p></form></div>');
 }
@@ -495,7 +537,7 @@ function queuePage(ticketId) {
     + yours
     + '<div class="panel"><h2>Join the line</h2>'
     + '<form method="POST" action="/queue/join">'
-    + '<p><input type="text" name="name" placeholder="Display name (any name)" required></p>'
+    + '<p><input type="text" name="name" value="' + esc(currentIdentity.username) + '" required></p>'
     + '<p><button type="submit">Join the queue</button></p></form></div>'
     + '<div class="panel"><h2>Let the next one in</h2>'
     + '<p style="font-size:13px">When traffic clears, the next person in line gets let in.</p>'
@@ -527,7 +569,7 @@ function bountiesPage() {
     + (closed.length ? '<h2 style="letter-spacing:1px">CLOSED</h2>' + closed.map(row).join('') : '')
     + '<div class="panel"><h2>Post a bounty</h2>'
     + '<form method="POST" action="/bounties/new">'
-    + '<p><input type="text" name="poster" placeholder="Your display name (any name)" required></p>'
+    + '<p><input type="text" name="poster" value="' + esc(currentIdentity.username) + '" required></p>'
     + '<p><textarea name="question" rows="3" placeholder="What do you need answered?" required></textarea></p>'
     + '<p><input type="text" name="reward" placeholder="Reward in KRX, e.g. 100" required></p>'
     + '<p><button type="submit">Post bounty</button></p></form></div>');
@@ -559,11 +601,28 @@ function bountyPage(b) {
     + (b.status === 'open'
       ? '<div class="panel"><h2>Answer this bounty</h2>'
         + '<form method="POST" action="/bounty/' + b.id + '/answer">'
-        + '<p><input type="text" name="author" placeholder="Display name (any name)" required></p>'
-        + '<p><input type="text" name="wallet" placeholder="Your Keryx wallet address (keryx:…)" required></p>'
+        + '<p><input type="text" name="author" value="' + esc(currentIdentity.username) + '" required></p>'
+        + '<p><input type="text" name="wallet" value="' + esc(currentIdentity.wallet) + '" placeholder="Your Keryx wallet address (keryx:…)" required></p>'
         + '<p><textarea name="body" rows="4" placeholder="Your answer…" required></textarea></p>'
         + '<p><button type="submit">Post answer</button></p></form></div>'
       : ''));
+}
+
+function accountPage() {
+  const id = currentIdentity;
+  return page('Account',
+    '<p><a href="/">← Sector index</a></p>'
+    + '<div class="panel"><h2>Your account</h2>'
+    + '<p>No password, no email. This forum remembers you by a cookie in your browser '
+    + '(<code>swarm_id</code>, good for a year). Your session ID is '
+    + '<code>' + esc(id.token.slice(0, 12)) + '…</code> — anyone with the full cookie can post as you, '
+    + 'so do not share it.</p>'
+    + '<p>Your posts, bounty answers and queue tickets use the name and wallet below, unless you type a different name in a form.</p></div>'
+    + '<div class="panel"><h2>Change your username</h2>'
+    + '<form method="POST" action="/account">'
+    + '<p><input type="text" name="username" value="' + esc(id.username) + '" required></p>'
+    + '<p><input type="text" name="wallet" value="' + esc(id.wallet) + '" placeholder="Your Keryx wallet address (keryx:…)"></p>'
+    + '<p><button type="submit">Save</button></p></form></div>');
 }
 
 function adminLogPage() {
@@ -600,8 +659,10 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
     const path = url.pathname;
+    ensureIdentity(req, res);
 
     if (req.method === 'GET' && path === '/') return send(res, 200, homePage());
+    if (req.method === 'GET' && path === '/account') return send(res, 200, accountPage());
     if (req.method === 'GET' && path === '/queue') {
       const ticket = Number(url.searchParams.get('ticket') || 0) || null;
       return send(res, 200, queuePage(ticket));
@@ -659,8 +720,18 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST') {
       const body = new URLSearchParams(await readBody(req));
+      if (path === '/account') {
+        const username = (body.get('username') || '').trim().slice(0, 80);
+        const wallet = (body.get('wallet') || '').trim().slice(0, 120);
+        if (!username) return send(res, 400, page('Error', '<p>Username is required.</p>'));
+        db.prepare('UPDATE identities SET username = ?, wallet = ? WHERE token = ?')
+          .run(username, wallet, currentIdentity.token);
+        currentIdentity.username = username;
+        currentIdentity.wallet = wallet;
+        return redirect(res, '/account');
+      }
       if (path === '/queue/join') {
-        const name = (body.get('name') || '').trim().slice(0, 80) || 'Anonymous';
+        const name = (body.get('name') || '').trim().slice(0, 80) || currentIdentity.username;
         const row = db.prepare('INSERT INTO queue (name, model, task, status, ip, user_agent, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
           .run(name, '', '', 'waiting', clientIp(req), String(req.headers['user-agent'] || '').slice(0, 300), nowIso());
         return redirect(res, '/queue?ticket=' + row.lastInsertRowid);
