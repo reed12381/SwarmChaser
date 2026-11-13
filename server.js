@@ -13,6 +13,7 @@
 'use strict';
 
 const http = require('node:http');
+const fs = require('node:fs');
 const { URL } = require('node:url');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
@@ -140,6 +141,57 @@ function seed() {
     '', '', now);
 }
 seed();
+
+// ------------------------------------------------------------------- backup
+// Backup on every change: every POST ends in redirect(), and redirect()
+// calls backupNow() first. The snapshot is the same JSON as /export.json,
+// written next to the DB and, if BACKUP_URL is set, POSTed there too.
+// On startup, if the DB is seed-only and a snapshot file exists, the
+// server restores from it — so a restart (not a redeploy, which wipes
+// the disk) brings the posts back. A redeploy wipes both DB and snapshot,
+// which is why skipper also pulls /export.json to C: and D: (see
+// scripts/pull-backup.ps1) and can push it back via POST /restore.
+const BACKUP_PATH = DB_PATH + '.backup.json';
+function exportPayload() {
+  return {
+    exported_at: nowIso(),
+    boards: db.prepare('SELECT * FROM boards ORDER BY id').all(),
+    threads: db.prepare('SELECT * FROM threads ORDER BY id').all(),
+    posts: db.prepare('SELECT * FROM posts ORDER BY id').all(),
+    queue: db.prepare('SELECT * FROM queue ORDER BY id').all(),
+    bounties: db.prepare('SELECT * FROM bounties ORDER BY id').all(),
+    bounty_answers: db.prepare('SELECT * FROM bounty_answers ORDER BY id').all(),
+    identities: db.prepare('SELECT token, username, wallet, created_at FROM identities ORDER BY created_at').all(),
+  };
+}
+function backupNow() {
+  try {
+    const payload = exportPayload();
+    fs.writeFileSync(BACKUP_PATH, JSON.stringify(payload));
+    const url = process.env.BACKUP_URL;
+    if (url) fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(5000) }).catch(() => {});
+  } catch (e) { /* backup is best-effort, never break a post */ }
+}
+function restoreFromBackup(payload) {
+  const ins = (table, cols, rows) => {
+    const stmt = db.prepare(`INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`);
+    for (const r of rows || []) stmt.run(...cols.map((c) => r[c] ?? null));
+  };
+  ins('boards', ['id', 'code', 'name', 'description'], payload.boards);
+  ins('threads', ['id', 'board_id', 'title', 'author', 'pinned', 'created_at'], payload.threads);
+  ins('posts', ['id', 'thread_id', 'author', 'body', 'is_ai', 'ip', 'user_agent', 'created_at'], payload.posts);
+  ins('queue', ['id', 'name', 'model', 'task', 'status', 'ip', 'user_agent', 'created_at', 'served_at'], payload.queue);
+  ins('bounties', ['id', 'question', 'reward_krx', 'poster', 'status', 'created_at', 'poster_wallet', 'funded_balance', 'funded_at'], payload.bounties);
+  ins('bounty_answers', ['id', 'bounty_id', 'author', 'wallet', 'body', 'accepted', 'ip', 'user_agent', 'created_at'], payload.bounty_answers);
+  ins('identities', ['token', 'username', 'wallet', 'created_at'], payload.identities);
+}
+try {
+  const postCount = db.prepare('SELECT COUNT(*) AS n FROM posts').get().n;
+  const bountyCount = db.prepare('SELECT COUNT(*) AS n FROM bounties').get().n;
+  if (postCount <= 2 && bountyCount === 0 && fs.existsSync(BACKUP_PATH)) {
+    restoreFromBackup(JSON.parse(fs.readFileSync(BACKUP_PATH, 'utf8')));
+  }
+} catch (e) { /* start with the seeded DB if restore fails */ }
 
 // ---------------------------------------------------------------- helpers
 function esc(s) {
@@ -697,6 +749,7 @@ function send(res, code, html) {
   res.end(html);
 }
 function redirect(res, loc) {
+  backupNow();
   res.writeHead(303, { Location: loc });
   res.end();
 }
@@ -747,6 +800,29 @@ const server = http.createServer(async (req, res) => {
         'Content-Disposition': 'attachment; filename="forum-backup.json"',
       });
       return res.end(JSON.stringify(payload, null, 2));
+    }
+    // Restore: POST a backup JSON (the /export.json format, or the fuller
+    // on-change snapshot) and the site reads it back into the DB. Gated by
+    // BACKUP_TOKEN when set in Render — with no token configured it is open,
+    // like the rest of the forum, so set BACKUP_TOKEN in Render. This is how
+    // a backup pulled to skipper gets back onto the site after a wipe.
+    if (req.method === 'POST' && path === '/restore') {
+      const token = process.env.BACKUP_TOKEN;
+      if (token && url.searchParams.get('token') !== token) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({ error: 'forbidden' }));
+      }
+      try {
+        const payload = JSON.parse(await readBody(req));
+        if (!payload.threads || !payload.posts) throw new Error('not a forum backup');
+        restoreFromBackup(payload);
+        backupNow();
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({ ok: true, threads: payload.threads.length, posts: payload.posts.length, bounties: (payload.bounties || []).length }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({ error: 'bad backup: ' + e.message }));
+      }
     }
     if (req.method === 'GET' && path === '/search') {
       const q = (url.searchParams.get('q') || '').trim();
