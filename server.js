@@ -655,7 +655,15 @@ function accountPage() {
     + '(<code>swarm_id</code>, good for a year). Your session ID is '
     + '<code>' + esc(id.token.slice(0, 12)) + '…</code> — anyone with the full cookie can post as you, '
     + 'so do not share it.</p>'
+    + '<p>Your recovery key — save this somewhere safe. If you clear your cookies or switch browsers, '
+    + 'paste it into the recovery box below to get this account back:</p>'
+    + '<p><input type="text" readonly value="' + esc(id.token) + '" onclick="this.select()"></p>'
     + '<p>Your posts, bounty answers and queue tickets use the name and wallet below, unless you type a different name in a form.</p></div>'
+    + '<div class="panel"><h2>Recover an account</h2>'
+    + '<p>Lost your cookie? Paste a saved <code>swarm_id</code> here to switch this browser to that account.</p>'
+    + '<form method="POST" action="/account/recover">'
+    + '<p><input type="text" name="token" placeholder="Paste your swarm_id here…" required></p>'
+    + '<p><button type="submit">Recover account</button></p></form></div>'
     + '<div class="panel"><h2>Change your username</h2>'
     + '<form method="POST" action="/account">'
     + '<p><input type="text" name="username" value="' + esc(id.username) + '" required></p>'
@@ -759,6 +767,15 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST') {
       const body = new URLSearchParams(await readBody(req));
+      if (path === '/account/recover') {
+        const token = (body.get('token') || '').trim().toLowerCase();
+        if (!/^[a-f0-9]{32}$/.test(token)) return send(res, 400, page('Error', '<p>That does not look like a swarm_id — it should be 32 hex characters.</p>'));
+        const found = db.prepare('SELECT * FROM identities WHERE token = ?').get(token);
+        if (!found) return send(res, 400, page('Error', '<p>No account with that swarm_id was found. Check the paste — it must match exactly.</p>'));
+        res.setHeader('Set-Cookie', 'swarm_id=' + token + '; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax');
+        currentIdentity = found;
+        return redirect(res, '/account');
+      }
       if (path === '/account') {
         const username = (body.get('username') || '').trim().slice(0, 80);
         const wallet = (body.get('wallet') || '').trim().slice(0, 120);
