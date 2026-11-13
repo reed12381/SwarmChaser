@@ -1,10 +1,10 @@
-# SwarmChaser forum backup pull — runs on your backup machine (Windows PowerShell).
+# SwarmChaser forum backup pull - runs on your backup machine (Windows PowerShell).
 # Fetches the forum's /export.json and saves a timestamped copy PLUS a
 # latest.json to BOTH drives, so one drive failing never loses the backup:
 #   C:\ForumBackups\  (skipper's main drive)
 #   D:\ForumBackups\  (skipper's USB drive)
 # Best-effort per drive: if a drive is missing or the site is asleep/down,
-# it just warns and exits 0 — it never breaks anything else.
+# it just warns and exits 0 - it never breaks anything else.
 #
 # Set these before first use (or pass them in):
 #   $env:FORUM_URL    = "https://swarmchaser.onrender.com"   # no trailing slash
@@ -29,9 +29,9 @@ try {
     # Render free tier sleeps after ~15 min idle; first request can take ~60s to wake it.
     Invoke-WebRequest -Uri $url -OutFile $tmp -TimeoutSec 120 -UseBasicParsing | Out-Null
     $size = (Get-Item $tmp).Length
-    if ($size -lt 100) { Write-Warning "Export looked empty ($size bytes) — skipping this run."; exit 0 }
+    if ($size -lt 100) { Write-Warning "Export looked empty ($size bytes) - skipping this run."; exit 0 }
 } catch {
-    Write-Warning "Forum backup pull failed: $($_.Exception.Message) — skipping this run."
+    Write-Warning "Forum backup pull failed: $($_.Exception.Message) - skipping this run."
     exit 0
 }
 
@@ -43,7 +43,7 @@ foreach ($destDir in @("C:\ForumBackups", "D:\ForumBackups")) {
         Copy-Item $tmp (Join-Path $destDir "latest.json") -Force
         Write-Output "Forum backup saved: $dest ($size bytes)"
     } catch {
-        Write-Warning "Could not save to $destDir : $($_.Exception.Message) — other drive may still have it."
+        Write-Warning "Could not save to $destDir : $($_.Exception.Message) - other drive may still have it."
     }
 }
 Remove-Item $tmp -Force -ErrorAction SilentlyContinue

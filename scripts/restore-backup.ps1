@@ -1,4 +1,4 @@
-# SwarmChaser forum restore — pushes a backup file back to the site after
+# SwarmChaser forum restore - pushes a backup file back to the site after
 # a wipe, so the site can read it again. Uses the newest backup it can find:
 #   C:\ForumBackups\latest.json, then D:\ForumBackups\latest.json
 # Run it on skipper after a Render redeploy wipes the forum DB:
